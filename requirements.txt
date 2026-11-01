@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]
 tavily-python
 upstash-redis
 edge-tts
+shotstack-sdk
