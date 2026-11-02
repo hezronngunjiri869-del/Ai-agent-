@@ -25,6 +25,8 @@ import telegram
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from tavily import TavilyClient
 from upstash_redis import Redis
+import cloudinary
+import cloudinary.uploader
 
 # --- Keys ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -33,6 +35,13 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 UPSTASH_URL = os.environ.get("UPSTASH_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_TOKEN", "")
 SHOTSTACK_KEY = os.environ.get("SHOTSTACK_KEY", "")
+
+# --- Cloudinary Config ---
+cloudinary.config(
+    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME", ""),
+    api_key=os.environ.get("CLOUDINARY_API_KEY", ""),
+    api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
+)
 
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
@@ -70,14 +79,14 @@ def get_crypto_price(coin="btc"):
         coin_id = coin_map.get(coin.lower(), "btc-bitcoin")
         url = f"https://api.coinpaprika.com/v1/tickers/{coin_id}"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode('utf-8'))
             usd_price = float(data['quotes']['USD']['price'])
             symbol = data['symbol']
 
         fx_url = "https://open.er-api.com/v6/latest/USD"
         req_fx = urllib.request.Request(fx_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req_fx) as response:
+        with urllib.request.urlopen(req_fx, timeout=15) as response:
             fx_data = json.loads(response.read().decode('utf-8'))
             kes_rate = fx_data['rates']['KES']
         return f"{symbol}: ${usd_price:,.2f} USD (≈ KES {usd_price * kes_rate:,.2f})"
@@ -111,32 +120,26 @@ def generate_image(prompt):
         clean_prompt = urllib.parse.quote(prompt)
         url = f"https://image.pollinations.ai/prompt/{clean_prompt}?width=1024&height=1024&nologo=true"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             return response.read()
     except Exception:
         return None
 
-def upload_file(file_bytes, filename):
+# --- FILE UPLOADER (CLOUDINARY) ---
+def upload_to_cloudinary(file_bytes, filename):
     try:
-        boundary = '----WebKitFormBoundary' + str(uuid.uuid4())
-        body = b''
-        body += f'--{boundary}\r\n'.encode('utf-8')
-        body += f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode('utf-8')
-        body += b'Content-Type: application/octet-stream\r\n\r\n'
-        body += file_bytes
-        body += f'\r\n--{boundary}--\r\n'.encode('utf-8')
-
-        req = urllib.request.Request("https://0x0.st", data=body, method='POST')
-        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-        req.add_header('User-Agent', 'Mozilla/5.0')
-
-        with urllib.request.urlopen(req) as response:
-            url = response.read().decode('utf-8').strip()
-            if url.startswith("https://"):
-                return url
-            return f"Upload failed: {url}"
+        # Save bytes to temp file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}")
+        temp_file.write(file_bytes)
+        temp_file.close()
+        
+        # Upload to Cloudinary (auto resource type handles images, audio, and video)
+        result = cloudinary.uploader.upload(temp_file.name, resource_type="auto")
+        
+        os.unlink(temp_file.name)
+        return result['secure_url']
     except Exception as e:
-        return f"Upload error: {str(e)}"
+        return f"Cloudinary Upload Error: {str(e)}"
 
 def render_video(image_url, audio_url, duration=20.0):
     try:
@@ -159,7 +162,7 @@ def render_video(image_url, audio_url, duration=20.0):
             response = api_instance.post_render(edit)
             render_id = response['response']['id']
             
-            for _ in range(30):
+            for _ in range(60):
                 time.sleep(2)
                 status_response = api_instance.get_render(render_id, data=False)
                 status = status_response['response']['status']
@@ -178,7 +181,7 @@ def ask_groq(messages):
     headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {GROQ_API_KEY}', 'User-Agent': 'HezzyAI/1.0'}
     req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers, method='POST')
     try:
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             parsed = json.loads(response.read().decode('utf-8'))
             return parsed['choices'][0]['message']['content']
     except Exception:
@@ -193,32 +196,41 @@ async def safe_reply(update, text):
 
 # --- BACKGROUND VIDEO WORKER ---
 async def process_video_background(update, context, topic):
+    chat_id = update.effective_chat.id
     try:
+        print("BACKGROUND: Starting script generation...")
         prompt = f"Write a 15-second viral TikTok script about {topic}. It must be around 35 to 40 words maximum. Keep it punchy."
         script = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
         
+        print("BACKGROUND: Generating image...")
         image_bytes = await asyncio.to_thread(generate_image, f"TikTok background for a video about {topic}, cinematic")
+        
+        print("BACKGROUND: Generating audio...")
         audio_bytes = await generate_audio(script)
         
         if not image_bytes or not audio_bytes:
-            await safe_reply(update, "❌ Failed to generate image or audio internally.")
+            await context.bot.send_message(chat_id=chat_id, text="❌ Failed to generate image or audio internally.")
             return
 
-        image_url = await asyncio.to_thread(upload_file, image_bytes, "image.jpg")
-        audio_url = await asyncio.to_thread(upload_file, audio_bytes, "audio.mp3")
+        print("BACKGROUND: Uploading to Cloudinary...")
+        image_url = await asyncio.to_thread(upload_to_cloudinary, image_bytes, "image.jpg")
+        audio_url = await asyncio.to_thread(upload_to_cloudinary, audio_bytes, "audio.mp3")
         
         if not image_url.startswith("http") or not audio_url.startswith("http"):
-            await safe_reply(update, f"❌ Upload Failed.\nImage: {image_url}\nAudio: {audio_url}")
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Upload Failed.\nImage: {image_url}\nAudio: {audio_url}")
             return
 
+        print("BACKGROUND: Sending to Shotstack...")
         video_url = await asyncio.to_thread(render_video, image_url, audio_url, duration=20.0)
         
+        print(f"BACKGROUND: Finished. Result: {video_url}")
         if video_url.startswith("http"):
-            await safe_reply(update, f"✅ **Video Ready!**\n\nClick here to download: {video_url}")
+            await context.bot.send_message(chat_id=chat_id, text=f"✅ **Video Ready!**\n\nClick here to download: {video_url}")
         else:
-            await safe_reply(update, f"❌ Render Failed: {video_url}")
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Render Failed: {video_url}")
     except Exception as e:
-        await safe_reply(update, f"❌ Background Video Error: {str(e)}")
+        print(f"BACKGROUND ERROR: {str(e)}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Background Video Error: {str(e)}")
 
 # --- AUTOMATED MORNING REPORT ---
 async def send_morning_report(context: telegram.ext.CallbackContext):
@@ -308,7 +320,7 @@ def main():
         target_time = datetime.time(hour=5, minute=0, tzinfo=datetime.timezone.utc)
         job_queue.run_daily(send_morning_report, time=target_time)
 
-    print("Bot is running with Python 3.11 and Error Handlers...")
+    print("Bot is running with Cloudinary Uploader...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
