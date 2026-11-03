@@ -1,1 +1,9 @@
-python-3.11.9
+python-telegram-bot[job-queue]
+tavily-python
+upstash-redis
+edge-tts
+shotstack-sdk
+cloudinary
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
