@@ -6,6 +6,7 @@ import asyncio
 import time
 import uuid
 import datetime
+import re
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -111,6 +112,17 @@ def search_web(query):
     except Exception:
         return "Search unavailable."
 
+def extract_url_content(url):
+    try:
+        # Tavily Extract fetches the main text from a specific URL
+        response = tavily.extract(urls=[url])
+        if response and 'results' in response and len(response['results']) > 0:
+            content = response['results'][0].get('raw_content', '')
+            return content[:4000] # Limit to avoid token limits
+        return "Could not extract text from this URL."
+    except Exception as e:
+        return f"URL Extraction Error: {str(e)}"
+
 async def generate_audio(text):
     try:
         clean_text = text.replace("*", "").replace("#", "").replace("[", "").replace("]", "")
@@ -146,7 +158,7 @@ def upload_to_cloudinary(file_bytes, filename):
     except Exception as e:
         return f"Cloudinary Upload Error: {str(e)}"
 
-# --- SHOTSTACK RENDERER WITH DYNAMIC CAPTIONS ---
+# --- SHOTSTACK RENDERER ---
 def render_video(image_url, audio_url, script, duration=20.0):
     try:
         host = "https://api.shotstack.io/stage"
@@ -156,44 +168,27 @@ def render_video(image_url, audio_url, script, duration=20.0):
         with shotstack.ApiClient(configuration) as api_client:
             api_instance = edit_api.EditApi(api_client)
 
-            # 1. Image Track (Background)
             image_asset = ImageAsset(src=image_url)
             image_clip = Clip(asset=image_asset, start=0.0, length=float(duration))
             image_track = Track(clips=[image_clip])
 
-            # 2. Dynamic Captions (Word by Word)
-            words = script.replace("\n", " ").split()
-            chunks = [" ".join(words[i:i+3]) for i in range(0, len(words), 3)]
+            clean_script = re.sub(r'[^a-zA-Z0-9\s.,!?]', '', script)
+            words = clean_script.replace("\n", " ").split()
+            chunks = [" ".join(words[i:i+3]).upper() for i in range(0, len(words), 3)]
             if not chunks: chunks = ["VIDEO"]
             
             time_per_chunk = float(duration) / len(chunks)
             
             title_clips = []
             for i, chunk in enumerate(chunks):
-                title_asset = TitleAsset(
-                    text=chunk.upper(), 
-                    style="minimal", 
-                    size="medium", 
-                    position="center"
-                )
-                clip = Clip(
-                    asset=title_asset, 
-                    start=float(i * time_per_chunk), 
-                    length=float(time_per_chunk)
-                )
+                title_asset = TitleAsset(text=chunk, style="subtitle", size="medium", position="bottom")
+                clip = Clip(asset=title_asset, start=float(i * time_per_chunk), length=float(time_per_chunk))
                 title_clips.append(clip)
                 
             title_track = Track(clips=title_clips)
-
-            # 3. Audio
             soundtrack = Soundtrack(src=audio_url, effect="fadeInFadeOut")
 
-            # 4. Timeline
-            timeline = Timeline(
-                background="#000000", 
-                tracks=[image_track, title_track], 
-                soundtrack=soundtrack
-            )
+            timeline = Timeline(background="#000000", tracks=[image_track, title_track], soundtrack=soundtrack)
             output = Output(format="mp4", resolution="sd")
 
             edit = Edit(timeline=timeline, output=output)
@@ -317,7 +312,7 @@ async def error_handler(update, context):
     print(f"⚠️ ERROR: {context.error}")
 
 async def start(update, context):
-    await safe_reply(update, 'Hello Hezzy! Commands:\n/video <topic>\n/post tiktok|youtube <topic>\n/report')
+    await safe_reply(update, 'Hello Hezzy! Commands:\n/video <topic>\n/post tiktok|youtube <topic>\n/report\n\nOr just paste a link for me to analyze!')
 
 async def video_command(update, context):
     topic = " ".join(context.args)
@@ -370,6 +365,23 @@ async def handle_message(update, context):
         history = get_memory(user_id)
         history.append({"role": "user", "content": user_text})
         
+        # --- LINK READER ROUTER ---
+        url_match = re.search(r'https?://\S+', user_text)
+        if url_match:
+            url = url_match.group(0)
+            await safe_reply(update, f"🔗 Reading link: {url}...")
+            
+            extracted_text = await asyncio.to_thread(extract_url_content, url)
+            
+            if "Error" in extracted_text or "Could not" in extracted_text:
+                await safe_reply(update, f"❌ Failed to read link: {extracted_text}")
+                return
+                
+            prompt = f"Analyze the following content from the link {url}:\n\n{extracted_text}\n\nProvide a summary, key insights, and feedback."
+            reply = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
+            await safe_reply(update, reply)
+            return
+
         if "find me jobs" in lower_text or "find jobs" in lower_text:
             await safe_reply(update, "🕵️‍♂️ Scanning Upwork...")
             jobs_data = await asyncio.to_thread(search_web, "freelance jobs " + user_text)
@@ -416,7 +428,7 @@ def main():
 
     while True:
         try:
-            print("Bot is running with Dynamic Captions...")
+            print("Bot is running with Link Reader...")
             app.run_polling(drop_pending_updates=True)
         except telegram.error.TimedOut:
             print("⚠️ Telegram timed out. Restarting in 5 seconds...")
