@@ -425,21 +425,36 @@ async def handle_message(update, context):
         await safe_reply(update, f"❌ Error: {str(e)}")
 
 async def post_init(application):
+    async def post_init(application):
     await application.bot.delete_webhook(drop_pending_updates=True)
 
 def main():
     start_dummy_server()
     custom_request = HTTPXRequest(connection_pool_size=8, connect_timeout=30.0, read_timeout=30.0)
     app = Application.builder().token(TELEGRAM_TOKEN).request(custom_request).post_init(post_init).build()
-    
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("report", set_report))
     app.add_handler(CommandHandler("video", video_command))
     app.add_handler(CommandHandler("post", post_video_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    
+
     job_queue = app.job_queue
     if job_queue:
         target_time = datetime.time(hour=5, minute=0, tzinfo=datetime.timezone.utc)
-        job_queue.run_daily(send_
+        job_queue.run_daily(send_morning_report, time=target_time)
+
+    while True:
+        try:
+            print("Bot is running with TikTok Bypass...")
+            app.run_polling(drop_pending_updates=True)
+        except telegram.error.TimedOut:
+            print("⚠️ Telegram timed out. Restarting in 5 seconds...")
+            time.sleep(5)
+        except Exception as e:
+            print(f"⚠️ Unexpected error: {e}. Restarting in 5 seconds...")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
