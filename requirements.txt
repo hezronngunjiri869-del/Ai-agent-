@@ -3,3 +3,4 @@ tavily-python
 upstash-redis
 edge-tts
 cloudinary
+youtube-transcript-api
