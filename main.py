@@ -52,7 +52,7 @@ cloudinary.config(
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
-# --- FIXED: Dummy Web Server now supports GET and HEAD ---
+# --- Dummy Web Server ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -146,7 +146,8 @@ def upload_to_cloudinary(file_bytes, filename):
     except Exception as e:
         return f"Cloudinary Upload Error: {str(e)}"
 
-def render_video(image_url, audio_url, topic, duration=20.0):
+# --- SHOTSTACK RENDERER WITH DYNAMIC CAPTIONS ---
+def render_video(image_url, audio_url, script, duration=20.0):
     try:
         host = "https://api.shotstack.io/stage"
         configuration = shotstack.Configuration(host=host)
@@ -155,17 +156,44 @@ def render_video(image_url, audio_url, topic, duration=20.0):
         with shotstack.ApiClient(configuration) as api_client:
             api_instance = edit_api.EditApi(api_client)
 
+            # 1. Image Track (Background)
             image_asset = ImageAsset(src=image_url)
             image_clip = Clip(asset=image_asset, start=0.0, length=float(duration))
             image_track = Track(clips=[image_clip])
 
-            title_asset = TitleAsset(text=topic.upper(), style="minimal", size="large", position="center")
-            title_clip = Clip(asset=title_asset, start=0.0, length=float(duration))
-            title_track = Track(clips=[title_clip])
+            # 2. Dynamic Captions (Word by Word)
+            words = script.replace("\n", " ").split()
+            chunks = [" ".join(words[i:i+3]) for i in range(0, len(words), 3)]
+            if not chunks: chunks = ["VIDEO"]
+            
+            time_per_chunk = float(duration) / len(chunks)
+            
+            title_clips = []
+            for i, chunk in enumerate(chunks):
+                title_asset = TitleAsset(
+                    text=chunk.upper(), 
+                    style="minimal", 
+                    size="medium", 
+                    position="center"
+                )
+                clip = Clip(
+                    asset=title_asset, 
+                    start=float(i * time_per_chunk), 
+                    length=float(time_per_chunk)
+                )
+                title_clips.append(clip)
+                
+            title_track = Track(clips=title_clips)
 
+            # 3. Audio
             soundtrack = Soundtrack(src=audio_url, effect="fadeInFadeOut")
 
-            timeline = Timeline(background="#000000", tracks=[image_track, title_track], soundtrack=soundtrack)
+            # 4. Timeline
+            timeline = Timeline(
+                background="#000000", 
+                tracks=[image_track, title_track], 
+                soundtrack=soundtrack
+            )
             output = Output(format="mp4", resolution="sd")
 
             edit = Edit(timeline=timeline, output=output)
@@ -204,6 +232,7 @@ def ask_groq(messages):
     except Exception:
         return "AI error."
 
+# --- AUTO-POSTING ---
 def post_to_tiktok(video_url, caption):
     try:
         init_url = "https://open.tiktokapis.com/v2/post/publish/video/init/"
@@ -211,12 +240,7 @@ def post_to_tiktok(video_url, caption):
             "post_info": {"title": caption, "privacy_level": "SELF_ONLY", "is_aigc": True},
             "source_info": {"source": "PULL_FROM_URL", "video_url": video_url}
         }
-        req = urllib.request.Request(
-            init_url,
-            data=json.dumps(payload).encode('utf-8'),
-            headers={'Authorization': f'Bearer {TIKTOK_ACCESS_TOKEN}', 'Content-Type': 'application/json'},
-            method='POST'
-        )
+        req = urllib.request.Request(init_url, data=json.dumps(payload).encode('utf-8'), headers={'Authorization': f'Bearer {TIKTOK_ACCESS_TOKEN}', 'Content-Type': 'application/json'}, method='POST')
         with urllib.request.urlopen(req, timeout=30) as response:
             return "TikTok posted successfully (Private Draft)."
     except Exception as e:
@@ -227,19 +251,12 @@ def post_to_youtube(video_url, title, description):
         temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         urllib.request.urlretrieve(video_url, temp_video.name)
         temp_video.close()
-        
         creds = Credentials(token=YOUTUBE_ACCESS_TOKEN)
         youtube = build('youtube', 'v3', credentials=creds)
-        
-        body = {
-            'snippet': {'title': title[:100], 'description': description[:5000], 'categoryId': '22'},
-            'status': {'privacyStatus': 'public'}
-        }
-        
+        body = {'snippet': {'title': title[:100], 'description': description[:5000], 'categoryId': '22'}, 'status': {'privacyStatus': 'public'}}
         media = MediaFileUpload(temp_video.name, chunksize=-1, resumable=True)
         request = youtube.videos().insert(part='snippet,status', body=body, media_body=media)
         response = request.execute()
-        
         os.unlink(temp_video.name)
         return f"YouTube posted: https://youtu.be/{response['id']}"
     except Exception as e:
@@ -252,6 +269,7 @@ async def safe_reply(update, text):
     try: await update.message.reply_text(clean_text(text))
     except: pass
 
+# --- BACKGROUND WORKERS ---
 async def process_video_background(update, context, topic):
     chat_id = update.effective_chat.id
     try:
@@ -271,7 +289,7 @@ async def process_video_background(update, context, topic):
             await context.bot.send_message(chat_id=chat_id, text=f"❌ Upload Failed.")
             return
 
-        video_url = await asyncio.to_thread(render_video, image_url, audio_url, topic, duration=20.0)
+        video_url = await asyncio.to_thread(render_video, image_url, audio_url, script, duration=20.0)
         
         if video_url.startswith("http"):
             await context.bot.send_message(chat_id=chat_id, text=f"✅ **Video Ready!**\n\n{video_url}")
@@ -294,6 +312,7 @@ async def send_morning_report(context: telegram.ext.CallbackContext):
     except Exception as e:
         print(f"Report failed: {e}")
 
+# --- HANDLERS ---
 async def error_handler(update, context):
     print(f"⚠️ ERROR: {context.error}")
 
@@ -323,7 +342,7 @@ async def post_video_command(update, context):
     
     image_url = await asyncio.to_thread(upload_to_cloudinary, image_bytes, "image.jpg")
     audio_url = await asyncio.to_thread(upload_to_cloudinary, audio_bytes, "audio.mp3")
-    video_url = await asyncio.to_thread(render_video, image_url, audio_url, topic)
+    video_url = await asyncio.to_thread(render_video, image_url, audio_url, script)
     
     if not video_url.startswith("http"):
         await safe_reply(update, f"❌ Render failed: {video_url}")
@@ -380,10 +399,7 @@ async def post_init(application):
 
 def main():
     start_dummy_server()
-    
-    # FIX: Increase timeouts to prevent network drops
     custom_request = HTTPXRequest(connection_pool_size=8, connect_timeout=30.0, read_timeout=30.0)
-    
     app = Application.builder().token(TELEGRAM_TOKEN).request(custom_request).post_init(post_init).build()
     
     app.add_handler(CommandHandler("start", start))
@@ -398,13 +414,12 @@ def main():
         target_time = datetime.time(hour=5, minute=0, tzinfo=datetime.timezone.utc)
         job_queue.run_daily(send_morning_report, time=target_time)
 
-    # FIX: Infinite retry loop to prevent crashing if Telegram times out
     while True:
         try:
-            print("Bot is running...")
+            print("Bot is running with Dynamic Captions...")
             app.run_polling(drop_pending_updates=True)
         except telegram.error.TimedOut:
-            print("⚠️ Telegram timed out. Restarting polling in 5 seconds...")
+            print("⚠️ Telegram timed out. Restarting in 5 seconds...")
             time.sleep(5)
         except Exception as e:
             print(f"⚠️ Unexpected error: {e}. Restarting in 5 seconds...")
