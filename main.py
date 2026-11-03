@@ -24,7 +24,7 @@ from shotstack_sdk.model.output import Output
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import telegram
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
-from telegram.request import HTTPXRequest # Added for timeout fix
+from telegram.request import HTTPXRequest
 from tavily import TavilyClient
 from upstash_redis import Redis
 import cloudinary
@@ -43,7 +43,6 @@ SHOTSTACK_KEY = os.environ.get("SHOTSTACK_KEY", "")
 TIKTOK_ACCESS_TOKEN = os.environ.get("TIKTOK_ACCESS_TOKEN", "")
 YOUTUBE_ACCESS_TOKEN = os.environ.get("YOUTUBE_ACCESS_TOKEN", "")
 
-# --- Cloudinary Config ---
 cloudinary.config(
     cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME", ""),
     api_key=os.environ.get("CLOUDINARY_API_KEY", ""),
@@ -53,12 +52,16 @@ cloudinary.config(
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
-# --- Dummy Web Server ---
+# --- FIXED: Dummy Web Server now supports GET and HEAD ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
 def start_dummy_server():
     port = int(os.environ.get("PORT", 8080))
@@ -201,7 +204,6 @@ def ask_groq(messages):
     except Exception:
         return "AI error."
 
-# --- AUTO-POSTING FUNCTIONS ---
 def post_to_tiktok(video_url, caption):
     try:
         init_url = "https://open.tiktokapis.com/v2/post/publish/video/init/"
@@ -250,18 +252,16 @@ async def safe_reply(update, text):
     try: await update.message.reply_text(clean_text(text))
     except: pass
 
-# --- BACKGROUND VIDEO WORKER ---
 async def process_video_background(update, context, topic):
     chat_id = update.effective_chat.id
     try:
         prompt = f"Write a 15-second viral TikTok script about {topic}. It must be around 35 to 40 words maximum. Keep it punchy."
         script = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
-        
         image_bytes = await asyncio.to_thread(generate_image, f"TikTok background for a video about {topic}, cinematic")
         audio_bytes = await generate_audio(script)
         
         if not image_bytes or not audio_bytes:
-            await context.bot.send_message(chat_id=chat_id, text="❌ Failed to generate image or audio internally.")
+            await context.bot.send_message(chat_id=chat_id, text="❌ Failed to generate image or audio.")
             return
 
         image_url = await asyncio.to_thread(upload_to_cloudinary, image_bytes, "image.jpg")
@@ -278,9 +278,8 @@ async def process_video_background(update, context, topic):
         else:
             await context.bot.send_message(chat_id=chat_id, text=f"❌ Render Failed: {video_url}")
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Background Video Error: {str(e)}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Background Error: {str(e)}")
 
-# --- AUTOMATED MORNING REPORT ---
 async def send_morning_report(context: telegram.ext.CallbackContext):
     try:
         chat_id = redis.get("report_chat_id")
@@ -288,18 +287,16 @@ async def send_morning_report(context: telegram.ext.CallbackContext):
         btc = get_crypto_price("btc")
         eth = get_crypto_price("eth")
         news = search_web("latest technology news in Kenya today")
-        summary_prompt = f"Here are raw search results about Kenyan tech news: {news}. Write a clean, 3-bullet-point summary. Do not include random characters."
+        summary_prompt = f"Search results: {news}. Write a 3-bullet-point summary."
         clean_news = ask_groq([{"role": "user", "content": summary_prompt}])
         report_text = f"🌅 Good Morning, Hezzy!\n\n📈 Markets:\n{btc}\n{eth}\n\n📰 Tech News:\n{clean_news}"
         await context.bot.send_message(chat_id=int(chat_id), text=report_text)
     except Exception as e:
         print(f"Report failed: {e}")
 
-# --- ERROR HANDLER ---
 async def error_handler(update, context):
     print(f"⚠️ ERROR: {context.error}")
 
-# --- HANDLERS ---
 async def start(update, context):
     await safe_reply(update, 'Hello Hezzy! Commands:\n/video <topic>\n/post tiktok|youtube <topic>\n/report')
 
@@ -316,12 +313,10 @@ async def post_video_command(update, context):
     if len(args) < 2:
         await safe_reply(update, "Usage: /post tiktok|youtube <topic>")
         return
-    
     platform = args[0].lower()
     topic = " ".join(args[1:])
     
     await safe_reply(update, f"🎬 Generating and preparing to post to {platform}...")
-    
     script = await asyncio.to_thread(ask_groq, [{"role": "user", "content": f"Write a 15-second viral script about {topic}."}])
     image_bytes = await asyncio.to_thread(generate_image, f"TikTok background about {topic}")
     audio_bytes = await generate_audio(script)
@@ -335,27 +330,24 @@ async def post_video_command(update, context):
         return
     
     await safe_reply(update, f"📤 Video ready. Posting to {platform}...")
-    
     if platform == "tiktok":
         result = await asyncio.to_thread(post_to_tiktok, video_url, script)
     elif platform == "youtube":
         result = await asyncio.to_thread(post_to_youtube, video_url, topic, script)
     else:
-        result = "Unknown platform. Use 'tiktok' or 'youtube'."
-    
+        result = "Unknown platform."
     await safe_reply(update, result)
 
 async def set_report(update, context):
     chat_id = str(update.effective_chat.id)
     redis.set("report_chat_id", chat_id)
-    await safe_reply(update, "✅ Done! I will send your Market & Tech report every morning.")
+    await safe_reply(update, "✅ Done! I will send your report every morning.")
 
 async def handle_message(update, context):
     try:
         user_id = str(update.effective_user.id)
         user_text = update.message.text
         lower_text = user_text.lower()
-        
         history = get_memory(user_id)
         history.append({"role": "user", "content": user_text})
         
@@ -389,7 +381,7 @@ async def post_init(application):
 def main():
     start_dummy_server()
     
-    # FIX: Increase Telegram connection timeouts to prevent TimedOut errors
+    # FIX: Increase timeouts to prevent network drops
     custom_request = HTTPXRequest(connection_pool_size=8, connect_timeout=30.0, read_timeout=30.0)
     
     app = Application.builder().token(TELEGRAM_TOKEN).request(custom_request).post_init(post_init).build()
@@ -406,8 +398,17 @@ def main():
         target_time = datetime.time(hour=5, minute=0, tzinfo=datetime.timezone.utc)
         job_queue.run_daily(send_morning_report, time=target_time)
 
-    print("Bot is running with Timeout Fix...")
-    app.run_polling(drop_pending_updates=True)
+    # FIX: Infinite retry loop to prevent crashing if Telegram times out
+    while True:
+        try:
+            print("Bot is running...")
+            app.run_polling(drop_pending_updates=True)
+        except telegram.error.TimedOut:
+            print("⚠️ Telegram timed out. Restarting polling in 5 seconds...")
+            time.sleep(5)
+        except Exception as e:
+            print(f"⚠️ Unexpected error: {e}. Restarting in 5 seconds...")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
