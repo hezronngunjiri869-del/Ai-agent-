@@ -1,6 +1,10 @@
+
 python-telegram-bot[job-queue]
 tavily-python
 upstash-redis
 edge-tts
 cloudinary
-youtube-transcript-api
+numpy
+pandas
+pandas-ta
+yfinance
