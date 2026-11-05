@@ -5,3 +5,4 @@ edge-tts
 cloudinary
 pandas
 yfinance
+python-binance
