@@ -566,14 +566,14 @@ def main():
     app.add_handler(CommandHandler("video", video_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     
-    # Schedule the auto-trader to run every 1 hour (3600 seconds)
+    # TEST MODE: interval=60 means it runs every 60 seconds
     job_queue = app.job_queue
     if job_queue:
-        job_queue.run_repeating(auto_trade_job, interval=3600, first=10)
+        job_queue.run_repeating(auto_trade_job, interval=60, first=5)
 
     while True:
         try:
-            print("Bot is running with Auto-Trader...")
+            print("Bot is running in TEST MODE (1 min timer)...")
             app.run_polling(drop_pending_updates=True)
         except Exception as e:
             print(f"Restarting due to {e}")
@@ -581,4 +581,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
