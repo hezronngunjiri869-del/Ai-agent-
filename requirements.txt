@@ -6,3 +6,4 @@ cloudinary
 pandas
 yfinance
 alpaca-py
+requests
