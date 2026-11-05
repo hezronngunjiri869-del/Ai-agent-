@@ -507,10 +507,6 @@ async def trade_cmd(update, context):
 async def video_cmd(update, context):
     topic = " ".join(context.args)
     if not topic: return await update.message.reply_text("Example: /video AI in Kenya")
-     await update.message.reply_text(f"🎬 Buildi
-async def video_cmd(update, context):
-    topic = " ".join(context.args)
-    if not topic: return await update.message.reply_text("Example: /video AI in Kenya")
     
     await update.message.reply_text(f"🎬 Building video for: {topic}...")
     chat_id = update.effective_chat.id
@@ -585,3 +581,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
