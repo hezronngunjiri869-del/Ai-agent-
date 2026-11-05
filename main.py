@@ -507,5 +507,81 @@ async def trade_cmd(update, context):
 async def video_cmd(update, context):
     topic = " ".join(context.args)
     if not topic: return await update.message.reply_text("Example: /video AI in Kenya")
+     await update.message.reply_text(f"🎬 Buildi
+async def video_cmd(update, context):
+    topic = " ".join(context.args)
+    if not topic: return await update.message.reply_text("Example: /video AI in Kenya")
     
-    await update.message.reply_text(f"🎬 Buildi
+    await update.message.reply_text(f"🎬 Building video for: {topic}...")
+    chat_id = update.effective_chat.id
+    
+    async def process():
+        try:
+            script = await asyncio.to_thread(ask_groq, [{"role": "user", "content": f"Write a 15-second TikTok script (35-40 words) about {topic}."}])
+            img_bytes = await asyncio.to_thread(make_image, f"Cinematic background for {topic}")
+            aud_bytes = await make_audio(script)
+            
+            if not img_bytes or not aud_bytes: return await context.bot.send_message(chat_id, "Failed to make media.")
+            
+            img_url = await asyncio.to_thread(upload_cloud, img_bytes, "img.jpg")
+            aud_url = await asyncio.to_thread(upload_cloud, aud_bytes, "aud.mp3")
+            
+            video_url = await asyncio.to_thread(render_video, img_url, aud_url, script)
+            await context.bot.send_message(chat_id, f"✅ Video Ready:\n{video_url}")
+        except Exception as e:
+            await context.bot.send_message(chat_id, f"Error: {e}")
+
+    asyncio.create_task(process())
+
+async def handle_msg(update, context):
+    user_id = str(update.effective_user.id)
+    text = update.message.text
+    history = get_memory(user_id)
+    
+    url_match = re.search(r'https?://\S+', text)
+    if url_match:
+        await update.message.reply_text("🔗 Reading link...")
+        content = await asyncio.to_thread(read_link, url_match.group(0))
+        
+        if "Error" in content or "Could not" in content:
+            return await update.message.reply_text(f"❌ {content}")
+            
+        prompt = f"Here is the content from the link:\n\n{content}\n\nProvide a summary and key insights."
+        reply = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
+        await update.message.reply_text(reply)
+        return
+        
+    history.append({"role": "user", "content": text})
+    reply = await asyncio.to_thread(ask_groq, [{"role": "system", "content": "You are Hezzy's assistant."}] + history)
+    history.append({"role": "assistant", "content": reply})
+    save_memory(user_id, history)
+    await update.message.reply_text(reply)
+
+def main():
+    start_dummy_server()
+    req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+    app = Application.builder().token(TELEGRAM_TOKEN).request(req).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("report", set_report))
+    app.add_handler(CommandHandler("portfolio", portfolio_cmd))
+    app.add_handler(CommandHandler("analyze", analyze_cmd))
+    app.add_handler(CommandHandler("trade", trade_cmd))
+    app.add_handler(CommandHandler("video", video_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+    
+    # Schedule the auto-trader to run every 1 hour (3600 seconds)
+    job_queue = app.job_queue
+    if job_queue:
+        job_queue.run_repeating(auto_trade_job, interval=3600, first=10)
+
+    while True:
+        try:
+            print("Bot is running with Auto-Trader...")
+            app.run_polling(drop_pending_updates=True)
+        except Exception as e:
+            print(f"Restarting due to {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
