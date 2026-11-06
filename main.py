@@ -372,48 +372,254 @@ async def auto_trade_job(context: telegram.ext.CallbackContext):
                     report += f"❌ {asset}: Close Short failed. {str(e)[:50]}\n"
             elif position == 0:
                 # We are FLAT. We open a LONG.
+# --- AUTOMATED TRADING JOB (WITH POSITION CHECK & NAN FIX) ---
+async def auto_trade_job(context: telegram.ext.CallbackContext):
+    chat_id = redis.get("report_chat_id")
+    if not chat_id: return
+    assets = [("BTC", True), ("AAPL", False), ("ETH", True), ("TSLA", False)]
+    report = "🤖 **Automated Trader Update**\n\n"
+    lessons = get_trading_lessons()
+
+    for asset, is_crypto in assets:
+        if is_crypto:
+            data = await asyncio.to_thread(get_crypto_data, asset)
+            symbol = f"{asset}/USD"
+            tif = TimeInForce.GTC
+        else:
+            data = await asyncio.to_thread(get_stock_data, asset)
+            symbol = asset
+            tif = TimeInForce.DAY
+        if "error" in data or str(data.get('price')).lower() == 'nan':
+            report += f"❌ {asset}: Analysis failed (Invalid Data).\n"
+            continue
+        prompt = f"Lessons: {lessons}\nAnalyze {asset}: Price: {data['price']}, RSI: {data['rsi']}, MACD: {data['macd']}. Reply ONLY ONE WORD: 'BUY' or 'SELL'."
+        verdict = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
+        verdict = verdict.strip().upper()
+        position = await asyncio.to_thread(get_alpaca_position, symbol)
+        
+        if "BUY" in verdict:
+            if position < 0:
+                qty = abs(position)
+                try:
+                    order_data = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=tif)
+                    await asyncio.to_thread(alpaca_client.submit_order, order_data=order_data)
+                    report += f"✅ {asset}: Closed SHORT of {qty} at ${data['price']}.\n"
+                except Exception as e:
+                    report += f"❌ {asset}: Close Short failed. {str(e)[:50]}\n"
+            elif position == 0:
                 balance = await asyncio.to_thread(get_alpaca_balance)
                 if balance < 100:
-                    report += f"⚠️ {asset}: Not enough cash to buy.\n"
+                    report += f"⚠️ {asset}: Not enough cash.\n"
                     continue
                 qty = round(100 / data['price'], 4) if is_crypto else 1
                 try:
                     order_data = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=tif)
                     await asyncio.to_thread(alpaca_client.submit_order, order_data=order_data)
-                    report += f"✅ {asset}: AI said BUY. Opened LONG of {qty} at ${data['price']}.\n"
+                    report += f"✅ {asset}: Opened LONG of {qty} at ${data['price']}.\n"
                 except Exception as e:
                     report += f"❌ {asset}: Open Long failed. {str(e)[:50]}\n"
             else:
-                # We are already LONG. Do nothing.
-                report += f"⏸️ {asset}: AI said BUY, but already holding LONG. Skipped.\n"
+                report += f"⏸️ {asset}: Already holding LONG. Skipped.\n"
 
         elif "SELL" in verdict:
             if position > 0:
-                # We are LONG. We must SELL to close it.
                 qty = position
                 try:
                     order_data = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=tif)
                     await asyncio.to_thread(alpaca_client.submit_order, order_data=order_data)
-                    report += f"✅ {asset}: AI said SELL. Closed LONG of {qty} at ${data['price']}.\n"
+                    report += f"✅ {asset}: Closed LONG of {qty} at ${data['price']}.\n"
                 except Exception as e:
                     report += f"❌ {asset}: Close Long failed. {str(e)[:50]}\n"
             elif position == 0 and not is_crypto:
-                # We are FLAT and it's a stock. Open a SHORT.
                 try:
                     order_data = MarketOrderRequest(symbol=symbol, qty=1, side=OrderSide.SELL, time_in_force=tif)
                     await asyncio.to_thread(alpaca_client.submit_order, order_data=order_data)
-                    report += f"📉 {asset}: AI said SELL. Opened SHORT of 1 at ${data['price']}.\n"
+                    report += f"📉 {asset}: Opened SHORT of 1 at ${data['price']}.\n"
                 except Exception as e:
                     report += f"❌ {asset}: Open Short failed. {str(e)[:50]}\n"
             elif position == 0 and is_crypto:
-                report += f"⏸️ {asset}: AI said SELL, but you hold 0. Crypto cannot be shorted.\n"
+                report += f"⏸️ {asset}: Hold 0. Crypto cannot be shorted.\n"
             else:
-                # We are already SHORT. Do nothing.
-                report += f"⏸️ {asset}: AI said SELL, but already holding SHORT. Skipped.\n"
+                report += f"⏸️ {asset}: Already holding SHORT. Skipped.\n"
         else:
-            report += f"⏸️ {asset}: AI verdict was HOLD. No action.\n"
+            report += f"⏸️ {asset}: AI verdict was HOLD.\n"
 
     try:
         await context.bot.send_message(chat_id=int(chat_id), text=report)
     except:
         pass
+
+# --- DAILY REFLECTION JOB ---
+async def train_bot_daily(context: telegram.ext.CallbackContext):
+    chat_id = redis.get("report_chat_id")
+    if not chat_id: return
+    prompt = "You are an elite trading coach. Write ONE short, strict rule to avoid losses. (e.g. 'Never buy when RSI is above 70')."
+    new_rule = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
+    save_trading_lesson(new_rule)
+    msg = f"🧠 **Trader's Diary Updated**\n\nI have learned a new rule:\n📝 *{new_rule}*"
+    try:
+        await context.bot.send_message(chat_id=int(chat_id), text=msg)
+    except:
+        pass
+
+# --- TELEGRAM HANDLERS ---
+async def start(update, context):
+    await update.message.reply_text("Bot is alive. Commands:\n/analyze <asset>\n/video <topic>\n/trade <asset> <amount>\n/portfolio\n/report (Enable auto-trading)\n\nYou can also send a Voice Note or a Link!")
+
+async def set_report(update, context):
+    chat_id = str(update.effective_chat.id)
+    redis.set("report_chat_id", chat_id)
+    await update.message.reply_text("✅ Auto-Trader activated! I will analyze and trade every hour.")
+
+async def portfolio_cmd(update, context):
+    await update.message.reply_text("💼 Fetching your portfolio...")
+    try:
+        account = await asyncio.to_thread(alpaca_client.get_account)
+        cash = float(account.cash)
+        equity = float(account.equity)
+        positions = await asyncio.to_thread(alpaca_client.get_all_positions)
+        msg = f"📊 **Portfolio Summary**\n\n💰 Cash Balance: ${cash:,.2f}\n📈 Total Equity: ${equity:,.2f}\n\n"
+        if not positions:
+            msg += "No open positions."
+        else:
+            msg += "**Open Positions:**\n"
+            for p in positions:
+                msg += f"- **{p.symbol}**: {p.qty} shares\n"
+                msg += f"  Entry: ${float(p.avg_entry_price):,.2f} | Current: ${float(p.current_price):,.2f}\n"
+                msg += f"  PnL: ${float(p.unrealized_pl):,.2f} ({float(p.unrealized_plpc)*100:.2f}%)\n\n"
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed: {str(e)}")
+
+async def analyze_cmd(update, context):
+    asset = context.args[0] if context.args else "BTC"
+    asset = asset.upper()
+    await update.message.reply_text(f"📊 Analyzing {asset}...")
+    if asset in ["BTC", "ETH", "SOL"]:
+        data = await asyncio.to_thread(get_crypto_data, asset)
+        news = await asyncio.to_thread(search_web, f"{asset} crypto news")
+    else:
+        data = await asyncio.to_thread(get_stock_data, asset)
+        news = await asyncio.to_thread(search_web, f"{asset} stock news")
+    if "error" in data: return await update.message.reply_text(f"❌ {data['error']}")
+    lessons = get_trading_lessons()
+    prompt = f"Lessons: {lessons}\nAnalyze {asset}:\nPrice: {data['price']}\nRSI: {data['rsi']}\nMACD: {data['macd']}\nNews: {news}\nProvide: 1. Verdict (BUY/SELL/HOLD). 2. Confidence. 3. Reasoning."
+    reply = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
+    await update.message.reply_text(reply)
+
+async def trade_cmd(update, context):
+    args = context.args
+    if len(args) < 2: return await update.message.reply_text("Usage: /trade <asset> <amount>")
+    asset = args[0].upper()
+    try: quantity = float(args[1])
+    except: return await update.message.reply_text("Invalid amount.")
+    await update.message.reply_text(f"📊 Analyzing {asset}...")
+    is_crypto = asset in ["BTC", "ETH", "SOL"]
+    if is_crypto:
+        data = await asyncio.to_thread(get_crypto_data, asset)
+        symbol = f"{asset}/USD"
+        tif = TimeInForce.GTC
+    else:
+        data = await asyncio.to_thread(get_stock_data, asset)
+        symbol = asset
+        tif = TimeInForce.DAY
+    if "error" in data: return await update.message.reply_text(f"❌ {data['error']}")
+    lessons = get_trading_lessons()
+    prompt = f"Lessons: {lessons}\nAnalyze {asset}: Price: {data['price']}, RSI: {data['rsi']}, MACD: {data['macd']}. Reply ONLY ONE WORD: 'BUY' or 'SELL'."
+    verdict = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
+    verdict = verdict.strip().upper()
+    if "BUY" in verdict: side = OrderSide.BUY
+    elif "SELL" in verdict: side = OrderSide.SELL
+    else: return await update.message.reply_text(f"🤖 AI said {verdict}.")
+    if side == OrderSide.SELL and is_crypto:
+        position = await asyncio.to_thread(get_alpaca_position, symbol)
+        if position < quantity: return await update.message.reply_text(f"⚠️ Blocked: Hold {position} {asset}.")
+    if side == OrderSide.BUY:
+        balance = await asyncio.to_thread(get_alpaca_balance)
+        cost = data['price'] * quantity
+        if balance < cost: return await update.message.reply_text(f"⚠️ Blocked: Need ${cost:,.2f}.")
+    try:
+        order_data = MarketOrderRequest(symbol=symbol, qty=quantity, side=side, time_in_force=tif)
+        order = await asyncio.to_thread(alpaca_client.submit_order, order_data=order_data)
+        await update.message.reply_text(f"✅ Executed: {side} {quantity} {symbol}.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed: {str(e)}")
+
+async def video_cmd(update, context):
+    topic = " ".join(context.args)
+    if not topic: return await update.message.reply_text("Example: /video AI in Kenya")
+    await update.message.reply_text(f"🎬 Building video for: {topic}...")
+    chat_id = update.effective_chat.id
+    async def process():
+        try:
+            script = await asyncio.to_thread(ask_groq, [{"role": "user", "content": f"Write a 15-second TikTok script (35-40 words) about {topic}."}])
+            img_bytes = await asyncio.to_thread(make_image, f"Cinematic background for {topic}")
+            aud_bytes = await make_audio(script)
+            if not img_bytes or not aud_bytes: return await context.bot.send_message(chat_id, "Failed to make media.")
+            img_url = await asyncio.to_thread(upload_cloud, img_bytes, "img.jpg")
+            aud_url = await asyncio.to_thread(upload_cloud, aud_bytes, "aud.mp3")
+            video_url = await asyncio.to_thread(render_video, img_url, aud_url, script)
+            await context.bot.send_message(chat_id, f"✅ Video Ready:\n{video_url}")
+        except Exception as e:
+            await context.bot.send_message(chat_id, f"Error: {e}")
+    asyncio.create_task(process())
+
+async def handle_voice(update, context):
+    await update.message.reply_text("🎙️ Transcribing...")
+    voice_file = await update.message.voice.get_file()
+    temp_path = f"voice_{update.effective_user.id}.ogg"
+    await voice_file.download_to_drive(temp_path)
+    transcribed_text = await asyncio.to_thread(transcribe_voice, temp_path)
+    if not transcribed_text or "Error" in transcribed_text:
+        return await update.message.reply_text(f"❌ Could not understand: {transcribed_text}")
+    await update.message.reply_text(f"🗣️ You said: \"{transcribed_text}\"")
+    update.message.text = transcribed_text
+    await handle_msg(update, context) 
+    if os.path.exists(temp_path): os.remove(temp_path)
+
+async def handle_msg(update, context):
+    user_id = str(update.effective_user.id)
+    text = update.message.text
+    history = get_memory(user_id)
+    url_match = re.search(r'https?://\S+', text)
+    if url_match:
+        await update.message.reply_text("🔗 Reading link...")
+        content = await asyncio.to_thread(read_link, url_match.group(0))
+        if "Error" in content or "Could not" in content:
+            return await update.message.reply_text(f"❌ {content}")
+        prompt = f"Content: {content}\nProvide summary."
+        reply = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
+        await update.message.reply_text(reply)
+        return
+    history.append({"role": "user", "content": text})
+    reply = await asyncio.to_thread(ask_groq, [{"role": "system", "content": "You are Hezzy's assistant."}] + history)
+    history.append({"role": "assistant", "content": reply})
+    save_memory(user_id, history)
+    await update.message.reply_text(reply)
+
+def main():
+    start_dummy_server()
+    req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+    app = Application.builder().token(TELEGRAM_TOKEN).request(req).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("report", set_report))
+    app.add_handler(CommandHandler("portfolio", portfolio_cmd))
+    app.add_handler(CommandHandler("analyze", analyze_cmd))
+    app.add_handler(CommandHandler("trade", trade_cmd))
+    app.add_handler(CommandHandler("video", video_cmd))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+    job_queue = app.job_queue
+    if job_queue:
+        job_queue.run_repeating(auto_trade_job, interval=3600, first=10)
+        job_queue.run_repeating(train_bot_daily, interval=86400, first=3600)
+    while True:
+        try:
+            print("Bot is running...")
+            app.run_polling(drop_pending_updates=True)
+        except Exception as e:
+            print(f"Restarting due to {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
