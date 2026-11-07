@@ -186,14 +186,19 @@ def get_alpaca_balance():
 
 # FIXED: Returns None if API fails, so we don't accidentally stack trades
 def get_alpaca_position(symbol):
-    try:
-        pos = alpaca_client.get_open_position(symbol_or_asset_id=symbol)
-        return float(pos.qty), float(pos.unrealized_plpc)
-    except Exception as e:
-        if "position does not exist" in str(e).lower():
-            return 0.0, 0.0
-        return None, None # API failed
-
+    # Try up to 3 times to get the position
+    for attempt in range(3):
+        try:
+            pos = alpaca_client.get_open_position(symbol_or_asset_id=symbol)
+            return float(pos.qty), float(pos.unrealized_plpc)
+        except Exception as e:
+            if "position does not exist" in str(e).lower():
+                return 0.0, 0.0
+            # If it's a timeout or rate limit, wait 2 seconds and try again
+            print(f"API Timeout on {symbol}. Retrying... ({attempt+1}/3)")
+            time.sleep(2)
+            
+    return None, None # If all 3 attempts fail, return None
 def make_image(prompt):
     try:
         url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?width=1024&height=1024&nologo=true"
