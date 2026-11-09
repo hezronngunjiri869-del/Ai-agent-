@@ -17,6 +17,7 @@ import requests
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.common.exceptions import APIError
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import telegram
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
@@ -191,14 +192,25 @@ def get_alpaca_position(symbol):
         try:
             pos = alpaca_client.get_open_position(symbol_or_asset_id=symbol)
             return float(pos.qty), float(pos.unrealized_plpc)
-        except Exception as e:
+        except APIError as e:
+            # 404 means we simply don't have a position.
+            if e.status_code == 404:
+                return 0.0, 0.0
+            # 429 means we are going too fast. Wait 5 seconds.
+            if e.status_code == 429:
+                print(f"Rate limit hit for {symbol}. Waiting 5 seconds...")
+                time.sleep(5)
+                continue
+            # Catch specific "position does not exist" string if it doesn't throw a 404
             if "position does not exist" in str(e).lower():
                 return 0.0, 0.0
-            # If it's a timeout or rate limit, wait 2 seconds and try again
-            print(f"API Timeout on {symbol}. Retrying... ({attempt+1}/3)")
-            time.sleep(2)
+            print(f"Alpaca API Error on {symbol}: {e}")
+            time.sleep(3)
+        except Exception as e:
+            print(f"General Error fetching {symbol}: {e}")
+            time.sleep(3)
             
-    return None, None # If all 3 attempts fail, return None
+    return None, None # If all 3 attempts fail, return None to trigger the safety guard
 def make_image(prompt):
     try:
         url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?width=1024&height=1024&nologo=true"
