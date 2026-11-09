@@ -7,3 +7,4 @@ pandas
 yfinance
 alpaca-py
 requests
+pypdf
