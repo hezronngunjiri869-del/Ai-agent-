@@ -185,32 +185,24 @@ def get_alpaca_balance():
     except Exception:
         return 0.0
 
-# FIXED: Returns None if API fails, so we don't accidentally stack trades
 def get_alpaca_position(symbol):
-    # Try up to 3 times to get the position
     for attempt in range(3):
         try:
             pos = alpaca_client.get_open_position(symbol_or_asset_id=symbol)
             return float(pos.qty), float(pos.unrealized_plpc)
         except APIError as e:
-            # 404 means we simply don't have a position.
             if e.status_code == 404:
                 return 0.0, 0.0
-            # 429 means we are going too fast. Wait 5 seconds.
             if e.status_code == 429:
-                print(f"Rate limit hit for {symbol}. Waiting 5 seconds...")
                 time.sleep(5)
                 continue
-            # Catch specific "position does not exist" string if it doesn't throw a 404
             if "position does not exist" in str(e).lower():
                 return 0.0, 0.0
-            print(f"Alpaca API Error on {symbol}: {e}")
             time.sleep(3)
-        except Exception as e:
-            print(f"General Error fetching {symbol}: {e}")
+        except Exception:
             time.sleep(3)
-            
-    return None, None # If all 3 attempts fail, return None to trigger the safety guard
+    return None, None
+
 def make_image(prompt):
     try:
         url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?width=1024&height=1024&nologo=true"
@@ -270,9 +262,10 @@ async def auto_trade_job(context: telegram.ext.CallbackContext):
     assets = [("BTC", True), ("AAPL", False), ("ETH", True), ("TSLA", False)]
     report = "🤖 **Automated Trader Update**\n\n"
     lessons = get_trading_lessons()
-for asset, is_crypto in assets:
-    await asyncio.sleep(2) # ADD THIS LINE: Gives Alpaca a break between checks
-    if is_crypto:
+
+    for asset, is_crypto in assets:
+        await asyncio.sleep(2)
+        if is_crypto:
             data = await asyncio.to_thread(get_crypto_data, asset)
             symbol = f"{asset}/USD"
             tif = TimeInForce.GTC
@@ -287,12 +280,10 @@ for asset, is_crypto in assets:
             
         position, pnl_pct = await asyncio.to_thread(get_alpaca_position, symbol)
         
-        # FIX 1: API Guard
         if position is None:
             report += f"⚠️ {asset}: API Timeout. Could not verify position. Skipped to prevent stacking.\n"
             continue
 
-        # FIX 2: Stop Loss (-2%)
         if pnl_pct < -0.02:
             report += f"🛑 {asset}: Stop Loss Triggered! Position is down {pnl_pct*100:.2f}%. Forcing close.\n"
             try:
@@ -302,7 +293,7 @@ for asset, is_crypto in assets:
                 report += f"✅ {asset}: Closed position at ${data['price']} to prevent further loss.\n"
             except Exception as e:
                 report += f"❌ {asset}: Stop Loss failed. {str(e)[:50]}\n"
-            continue # Move to the next asset
+            continue
 
         prompt = f"Lessons: {lessons}\nAnalyze {asset}: Price: {data['price']}, RSI: {data['rsi']}, MACD: {data['macd']}. Reply ONLY ONE WORD: 'BUY' or 'SELL'."
         verdict = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
@@ -401,19 +392,24 @@ async def analyze_cmd(update, context):
     lessons = get_trading_lessons()
     prompt = f"Lessons: {lessons}\nAnalyze {asset}:\nPrice: {data['price']}\nRSI: {data['rsi']}\nMACD: {data['macd']}\nNews: {news}\nProvide: 1. Verdict (BUY/SELL/HOLD). 2. Confidence. 3. Reasoning."
     await update.message.reply_text(await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}]))
+
+async def task_cmd(update, context):
+    task_prompt = " ".join(context.args)
+    if not task_prompt:
+        return await update.message.reply_text("Usage: /task <paste the prompt here>")
+    await update.message.reply_text("🧠 Analyzing task and generating expert response...")
+    system_prompt = "You are an elite AI data annotator. Complete the following task with perfect accuracy. Follow any formatting rules strictly. Provide ONLY the final output requested without conversational filler."
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": task_prompt}]
+    reply = await asyncio.to_thread(ask_groq, messages, 2000)
+    await update.message.reply_text(f"✅ **Task Complete:**\n\n{reply}")
+
 async def trade_cmd(update, context):
     args = context.args
-    if len(args) < 2: 
-        return await update.message.reply_text("Usage: /trade <asset> <amount>")
-    
+    if len(args) < 2: return await update.message.reply_text("Usage: /trade <asset> <amount>")
     asset = args[0].upper()
-    try: 
-        quantity = float(args[1])
-    except: 
-        return await update.message.reply_text("Invalid amount.")
-        
+    try: quantity = float(args[1])
+    except: return await update.message.reply_text("Invalid amount.")
     await update.message.reply_text(f"📊 Analyzing {asset}...")
-    
     is_crypto = asset in ["BTC", "ETH", "SOL"]
     if is_crypto:
         data = await asyncio.to_thread(get_crypto_data, asset)
@@ -423,73 +419,37 @@ async def trade_cmd(update, context):
         data = await asyncio.to_thread(get_stock_data, asset)
         symbol = asset
         tif = TimeInForce.DAY
-        
-    if "error" in data: 
-        return await update.message.reply_text(f"❌ {data['error']}")
-        
-    lessons = get_trading_lessons()
-    prompt = f"Lessons: {lessons}\nAnalyze {asset}: Price: {data['price']}, RSI: {data['rsi']}, MACD: {data['macd']}. Reply ONLY ONE WORD: 'BUY' or 'SELL'."
-    
-    verdict = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
-    verdict = verdict.strip().upper()
-    
-    if "BUY" in verdict: 
-        side = OrderSide.BUY
-    elif "SELL" in verdict: 
-        side = OrderSide.SELL
-    else: 
-        return await update.message.reply_text(f"🤖 AI said {verdict}.")
-        
-    if side == OrderSide.SELL and is_crypto:
-        position, _ = await asyncio.to_thread(get_alpaca_position, symbol)
-        if position is None or position < quantity: 
-            return await update.message.reply_text(f"⚠️ Blocked: You only hold {position} {asset}. Crypto cannot be shorted.")
+            if "error" in data: 
+            return await update.message.reply_text(f"❌ {data['error']}")
             
-    if side == OrderSide.BUY:
-        balance = await asyncio.to_thread(get_alpaca_balance)
-        cost = data['price'] * quantity
-        if balance < cost: 
-            return await update.message.reply_text(f"⚠️ Blocked: Need ${cost:,.2f}, but you have ${balance:,.2f}.")
-            
-    try:
-        await asyncio.to_thread(alpaca_client.submit_order, order_data=MarketOrderRequest(symbol=symbol, qty=quantity, side=side, time_in_force=tif))
-        await update.message.reply_text(f"✅ Executed: {side} {quantity} {symbol}.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {str(e)}")
+        lessons = get_trading_lessons()
+        prompt = f"Lessons: {lessons}\nAnalyze {asset}: Price: {data['price']}, RSI: {data['rsi']}, MACD: {data['macd']}. Reply ONLY ONE WORD: 'BUY' or 'SELL'."
+        verdict = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
+        verdict = verdict.strip().upper()
         
-async def task_cmd(update, context):
-    task_prompt = " ".join(context.args)
-    if not task_prompt:
-        return await update.message.reply_text("Usage: /task <paste the prompt from DataAnnotation/Outlier here>")
-    await update.message.reply_text("🧠 Analyzing task and generating expert response...")
-    system_prompt = "You are an elite AI data annotator. Complete the following task with perfect accuracy. Follow any formatting rules strictly. Provide ONLY the final output requested without conversational filler."
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": task_prompt}]
-    reply = await asyncio.to_thread(ask_groq, messages, 2000)
-    await update.message.reply_text(f"✅ **Task Complete:**\n\n{reply}")
-
-    prompt = f"Lessons: {lessons}\nAnalyze {asset}: Price: {data['price']}, RSI: {data['rsi']}, MACD: {data['macd']}. Reply ONLY ONE WORD: 'BUY' or 'SELL'."
-    verdict = await asyncio.to_thread(ask_groq, [{"role": "user", "content": prompt}])
-    verdict = verdict.strip().upper()
-    
-    if "BUY" in verdict: side = OrderSide.BUY
-    elif "SELL" in verdict: side = OrderSide.SELL
-    else: return await update.message.reply_text(f"🤖 AI said {verdict}.")
-    
-    if side == OrderSide.SELL and is_crypto:
-        position, _ = await asyncio.to_thread(get_alpaca_position, symbol)
-        if position is None or position < quantity: 
-            return await update.message.reply_text(f"⚠️ Blocked: You only hold {position} {asset}. Crypto cannot be shorted.")
+        if "BUY" in verdict: 
+            side = OrderSide.BUY
+        elif "SELL" in verdict: 
+            side = OrderSide.SELL
+        else: 
+            return await update.message.reply_text(f"🤖 AI said {verdict}.")
             
-    if side == OrderSide.BUY:
-        balance = await asyncio.to_thread(get_alpaca_balance)
-        cost = data['price'] * quantity
-        if balance < cost: return await update.message.reply_text(f"⚠️ Blocked: Need ${cost:,.2f}, but you have ${balance:,.2f}.")
-        
-    try:
-        await asyncio.to_thread(alpaca_client.submit_order, order_data=MarketOrderRequest(symbol=symbol, qty=quantity, side=side, time_in_force=tif))
-        await update.message.reply_text(f"✅ Executed: {side} {quantity} {symbol}.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {str(e)}")
+        if side == OrderSide.SELL and is_crypto:
+            position, _ = await asyncio.to_thread(get_alpaca_position, symbol)
+            if position is None or position < quantity: 
+                return await update.message.reply_text(f"⚠️ Blocked: Hold {position} {asset}.")
+                
+        if side == OrderSide.BUY:
+            balance = await asyncio.to_thread(get_alpaca_balance)
+            cost = data['price'] * quantity
+            if balance < cost: 
+                return await update.message.reply_text(f"⚠️ Blocked: Need ${cost:,.2f}.")
+                
+        try:
+            await asyncio.to_thread(alpaca_client.submit_order, order_data=MarketOrderRequest(symbol=symbol, qty=quantity, side=side, time_in_force=tif))
+            await update.message.reply_text(f"✅ Executed: {side} {quantity} {symbol}.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed: {str(e)}")
 
 async def video_cmd(update, context):
     topic = " ".join(context.args)
@@ -527,7 +487,6 @@ async def handle_msg(update, context):
     text = update.message.text
     lower_text = text.lower()
     history = get_memory(user_id)
-    
     if "portfolio" in lower_text or "balance" in lower_text or "positions" in lower_text:
         return await portfolio_cmd(update, context)
     if "analyze" in lower_text and len(lower_text.split()) > 1:
@@ -536,7 +495,6 @@ async def handle_msg(update, context):
     if "task" in lower_text and len(lower_text.split()) > 1:
         context.args = lower_text.split()[1:]
         return await task_cmd(update, context)
-    
     url_match = re.search(r'https?://\S+', text)
     if url_match:
         await update.message.reply_text("🔗 Reading link...")
@@ -544,7 +502,6 @@ async def handle_msg(update, context):
         if "Error" in content or "Could not" in content: return await update.message.reply_text(f"❌ {content}")
         await update.message.reply_text(await asyncio.to_thread(ask_groq, [{"role": "user", "content": f"Content: {content}\nProvide summary."}]))
         return
-        
     history.append({"role": "user", "content": text})
     reply = await asyncio.to_thread(ask_groq, [{"role": "system", "content": "You are Hezzy's assistant."}] + history)
     history.append({"role": "assistant", "content": reply})
