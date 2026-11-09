@@ -270,9 +270,9 @@ async def auto_trade_job(context: telegram.ext.CallbackContext):
     assets = [("BTC", True), ("AAPL", False), ("ETH", True), ("TSLA", False)]
     report = "🤖 **Automated Trader Update**\n\n"
     lessons = get_trading_lessons()
-
-    for asset, is_crypto in assets:
-        if is_crypto:
+for asset, is_crypto in assets:
+    await asyncio.sleep(2) # ADD THIS LINE: Gives Alpaca a break between checks
+    if is_crypto:
             data = await asyncio.to_thread(get_crypto_data, asset)
             symbol = f"{asset}/USD"
             tif = TimeInForce.GTC
